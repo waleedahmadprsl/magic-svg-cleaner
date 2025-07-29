@@ -34,7 +34,9 @@ function resizeImageIfNeeded(canvas: HTMLCanvasElement, ctx: CanvasRenderingCont
 export const removeBackground = async (imageElement: HTMLImageElement): Promise<Blob> => {
   try {
     console.log('Starting background removal process...');
-    const segmenter = await pipeline('image-segmentation', 'Xenova/segformer-b0-finetuned-ade-512-512', {
+    
+    // Use proper background removal model
+    const remover = await pipeline('image-segmentation', 'briaai/RMBG-1.4', {
       device: 'webgpu',
     });
     
@@ -49,17 +51,27 @@ export const removeBackground = async (imageElement: HTMLImageElement): Promise<
     console.log(`Image ${wasResized ? 'was' : 'was not'} resized. Final dimensions: ${canvas.width}x${canvas.height}`);
     
     // Get image data as base64
-    const imageData = canvas.toDataURL('image/jpeg', 0.8);
+    const imageData = canvas.toDataURL('image/jpeg', 0.9);
     console.log('Image converted to base64');
     
-    // Process the image with the segmentation model
-    console.log('Processing with segmentation model...');
-    const result = await segmenter(imageData);
+    // Process the image with the background removal model
+    console.log('Processing with background removal model...');
+    const result = await remover(imageData);
     
-    console.log('Segmentation result:', result);
+    console.log('Background removal result:', result);
     
-    if (!result || !Array.isArray(result) || result.length === 0 || !result[0].mask) {
-      throw new Error('Invalid segmentation result');
+    if (!result || !Array.isArray(result) || result.length === 0) {
+      throw new Error('Invalid background removal result');
+    }
+    
+    // Find the mask result (RMBG models return different structure)
+    let maskData: any = null;
+    if (result[0].mask) {
+      maskData = result[0].mask.data;
+    } else if ((result[0] as any).data) {
+      maskData = (result[0] as any).data;
+    } else {
+      throw new Error('No mask data found in result');
     }
     
     // Create a new canvas for the masked image
@@ -81,10 +93,10 @@ export const removeBackground = async (imageElement: HTMLImageElement): Promise<
     );
     const data = outputImageData.data;
     
-    // Apply inverted mask to alpha channel
-    for (let i = 0; i < result[0].mask.data.length; i++) {
-      // Invert the mask value (1 - value) to keep the subject instead of the background
-      const alpha = Math.round((1 - result[0].mask.data[i]) * 255);
+    // Apply mask to alpha channel (RMBG models provide direct alpha values)
+    for (let i = 0; i < maskData.length; i++) {
+      // Use mask value directly as alpha (RMBG models are trained to output foreground masks)
+      const alpha = Math.round(maskData[i] * 255);
       data[i * 4 + 3] = alpha;
     }
     
@@ -108,6 +120,61 @@ export const removeBackground = async (imageElement: HTMLImageElement): Promise<
     });
   } catch (error) {
     console.error('Error removing background:', error);
+    
+    // Fallback: try with different model if first one fails
+    try {
+      console.log('Trying fallback background removal model...');
+      const fallbackRemover = await pipeline('image-segmentation', 'Xenova/modnet-photographic-portrait-matting', {
+        device: 'webgpu',
+      });
+      
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not get canvas context');
+      
+      resizeImageIfNeeded(canvas, ctx, imageElement);
+      const imageData = canvas.toDataURL('image/jpeg', 0.9);
+      
+      const result = await fallbackRemover(imageData);
+      
+      if (result && Array.isArray(result) && result.length > 0) {
+        const outputCanvas = document.createElement('canvas');
+        outputCanvas.width = canvas.width;
+        outputCanvas.height = canvas.height;
+        const outputCtx = outputCanvas.getContext('2d');
+        
+        if (!outputCtx) throw new Error('Could not get output canvas context');
+        
+        outputCtx.drawImage(canvas, 0, 0);
+        const outputImageData = outputCtx.getImageData(0, 0, outputCanvas.width, outputCanvas.height);
+        const data = outputImageData.data;
+        
+        const maskData = result[0].mask ? result[0].mask.data : (result[0] as any).data;
+        for (let i = 0; i < maskData.length; i++) {
+          data[i * 4 + 3] = Math.round(maskData[i] * 255);
+        }
+        
+        outputCtx.putImageData(outputImageData, 0, 0);
+        
+        return new Promise((resolve, reject) => {
+          outputCanvas.toBlob(
+            (blob) => {
+              if (blob) {
+                console.log('Fallback background removal successful');
+                resolve(blob);
+              } else {
+                reject(new Error('Failed to create blob with fallback'));
+              }
+            },
+            'image/png',
+            1.0
+          );
+        });
+      }
+    } catch (fallbackError) {
+      console.error('Fallback also failed:', fallbackError);
+    }
+    
     throw error;
   }
 };
